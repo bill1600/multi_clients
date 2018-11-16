@@ -13,6 +13,15 @@
 #include "dbg_err.h"
 #include "utlist.h"
 
+/*------------------------------------------------------------------
+ * client receive should be blocking, but have a timeout so we can
+*  detect terminate flag 
+*  client send should be blocking
+* 
+*  server receive should be blocking
+*  server send should be non-bocking so we can do send all
+---------------------------------------------------------------------*/
+
 #define SOCK_SEND_TIMEOUT_SEC 2
 #define MSG_HEADER_MARK 0xEE
 
@@ -233,6 +242,7 @@ int connect_server (void)
 		dbg_err (errno, "Unable to create rcv socket\n");
  		return -1;
 	}
+#if 0
 	flags = fcntl (sock, F_GETFL);
 	if (flags == -1) {
 		dbg_err (errno, "Unable to get socket flags: \n");
@@ -245,7 +255,7 @@ int connect_server (void)
 		close (sock);
  		return -1;
 	}
-
+#endif
 	if (bind (sock, (struct sockaddr *) &SRV.addr, 
           sizeof (struct sockaddr_in)) < 0) {
 		dbg_err (errno, "Unable to bind to receive socket %s\n");
@@ -275,6 +285,7 @@ int server_accept (void)
     return -1;
   }
   printf ("Accepted %d\n", sock);
+#if 0
   flags = fcntl (sock, F_GETFL);
   if (flags == -1) {
 	dbg_err (errno, "Unable to get socket flags: \n");
@@ -287,7 +298,7 @@ int server_accept (void)
 	close (sock);
 	return -1;
   }
-
+#endif
   conn = (struct connection *) malloc (sizeof (struct connection));
   if (NULL == conn) {
     printf ("Unable to malloc connection structure in receiver accept\n");
@@ -591,8 +602,9 @@ void wait_for_msgs (process_message_t handle_msg)
   printf ("Exiting wait_for_msgs\n");
 }
 
-int send_msg (int sock, const char *msg)
+int send_msg (int sock, const char *msg, bool non_block)
 {
+  int flags = 0;
   int sz_msg = strlen (msg) + 1; // '\0' too
   ssize_t bytes;
   int i;
@@ -614,7 +626,9 @@ int send_msg (int sock, const char *msg)
      return -1;
 #endif
   sz_msg += 4;
-  bytes = send (sock, msg_buf, sz_msg, 0);
+  if (non_block)
+    flags = MSG_DONTWAIT;
+  bytes = send (sock, msg_buf, sz_msg, flags);
   free (msg_buf);
   if (bytes < 0) { 
 	dbg_err (errno, "Error sending msg\n");
@@ -711,7 +725,7 @@ static void *client_receiver_thread (void *arg)
   //printf ("Ending client receiver thread for %d\n", getpid());
 }
 
-void server_send_pass (socket_list_t *sent_list, socket_list_t *err_list,
+void server_send_pass (socket_list_t *done_list, socket_list_t *not_done_list,
   const char *msg)
 {
   bool found = false;
@@ -721,23 +735,23 @@ void server_send_pass (socket_list_t *sent_list, socket_list_t *err_list,
     found = false;
     pthread_mutex_lock (&SRV.list_mutex);
     LL_FOREACH (SRV.connection_list, conn) {
-      if (find_socket_in_list (sent_list, conn->sock) >= 0)
+      if (find_socket_in_list (done_list, conn->sock) >= 0)
         continue;
-      if (find_socket_in_list (err_list, conn->sock) >= 0)
+      if (find_socket_in_list (not_done_list, conn->sock) >= 0)
         continue;
       found = true;
       if (conn->rcv_state == -2) { 
-        append_to_socket_list (sent_list, conn->sock);
+        append_to_socket_list (done_list, conn->sock);
         break;
       }
       if (conn->rcv_count == 0) {
-        append_to_socket_list (err_list, conn->sock);
+        append_to_socket_list (not_done_list, conn->sock);
         break;
       }
-      if (send_msg (conn->sock, msg) == 0)
-        append_to_socket_list (sent_list, conn->sock);
+      if (send_msg (conn->sock, msg, true) == 0)
+        append_to_socket_list (done_list, conn->sock);
       else
-        append_to_socket_list (err_list, conn->sock);
+        append_to_socket_list (not_done_list, conn->sock);
       break;
     }
     pthread_mutex_unlock (&SRV.list_mutex);
@@ -749,18 +763,18 @@ void server_send_pass (socket_list_t *sent_list, socket_list_t *err_list,
 int server_send_to_all_clients (const char *msg, unsigned timeout_ms)
 {
   int rtn;
-  socket_list_t sent_list;
-  socket_list_t err_list;
+  socket_list_t done_list;
+  socket_list_t not_done_list;
   struct connection *conn;
   unsigned delay = 0, total_delay = 0;
 
-  init_socket_list (&sent_list);
-  init_socket_list (&err_list);
+  init_socket_list (&done_list);
+  init_socket_list (&not_done_list);
   
   while (!server_received_something && !SRV.terminated)
     wait_msecs (250);
 
-  server_send_pass (&sent_list, &err_list, msg);
+  server_send_pass (&done_list, &not_done_list, msg);
 
   while (!SRV.terminated) {
     if (delay == 0)
@@ -777,21 +791,24 @@ int server_send_to_all_clients (const char *msg, unsigned timeout_ms)
       delay = 500;
     else if (delay == 500)
       delay = 1000;
+    if (timeout_ms != 0)
+      if ((total_delay+delay) > timeout_ms)
+        delay = timeout_ms - total_delay;
     wait_msecs (delay);
-    init_socket_list (&err_list);
-    server_send_pass (&sent_list, &err_list, msg);
+    init_socket_list (&not_done_list);
+    server_send_pass (&done_list, &not_done_list, msg);
     if (timeout_ms != 0) {
       total_delay += delay;
       if (total_delay >= timeout_ms) {
-        init_socket_list (&sent_list);
+        init_socket_list (&done_list);
         delay = 0;
         total_delay = 0;
       }
     }
   } // end while
-  rtn = err_list.used;
-  free_socket_list (&sent_list);
-  free_socket_list (&err_list);
+  rtn = not_done_list.used;
+  free_socket_list (&done_list);
+  free_socket_list (&not_done_list);
   return rtn;
 }
 
@@ -800,7 +817,7 @@ static void *server_send_thread (void *arg)
   int i, rtn;
 
   printf ("Starting server send thread\n");
-  rtn = server_send_to_all_clients ("Hello from the server!", 0);
+  rtn = server_send_to_all_clients ("Hello from the server!", 1000);
   if (0 != rtn)
     printf ("Messages not sent to %d clients\n", rtn);
   printf ("Ending server send thread\n");
@@ -825,7 +842,7 @@ void client_send_multiple (void)
 
   printf ("Sending %lu messages from pid %d\n", CLI.send_count, getpid());
 
-	for (i=0; i<CLI.send_count; i++) {
+  for (i=0; i<CLI.send_count; i++) {
 	  //if (i==100) // allow other senders to catch up
           //  wait_msecs (2000);
 	  if ((i>0) && (CLI.rcv_count == 0))
@@ -833,11 +850,11 @@ void client_send_multiple (void)
 	  else if (OPT.send_random)
 	    wait_random ();
 	  make_filled_msg (CLI.msg, i, buf);
-	  if (send_msg(CLI.sock, buf) != 0)
+	  if (send_msg(CLI.sock, buf, false) != 0)
 		break;
 	  if (OPT.print_send_msgs)
 	    printf ("Sent msg %lu\n", i);
-	}
+  }
 }
 
 
@@ -974,11 +991,11 @@ int main (const int argc, const char **argv)
 	if (NULL != SRV.port_str) {
 	  if (connect_server () < 0)
 		exit(4);
-	  if (create_thread (&server_send_thread_id, server_send_thread) != 0)
-		exit (4);
-	  wait_for_msgs (process_rcv_msg);
-	  pthread_join (server_send_thread_id, NULL);
-	  //shutdown_client ();	
+	  if (create_thread (&server_send_thread_id, server_send_thread) == 0)
+	  {
+	    wait_for_msgs (process_rcv_msg);
+	    pthread_join (server_send_thread_id, NULL);
+	  }
 	  shutdown_server ();
 	  pthread_mutex_destroy (&SRV.list_mutex);
 	}
@@ -990,11 +1007,12 @@ int main (const int argc, const char **argv)
 	  }
 	  if (connect_client () < 0)
 		exit(4);
-	  if (create_thread (&client_rcv_thread_id, client_receiver_thread) != 0)
-		exit (4);
- 	  client_send_multiple ();
-          CLI.terminated = true;
-          pthread_join (client_rcv_thread_id, NULL);
+	  if (create_thread (&client_rcv_thread_id, client_receiver_thread) == 0)
+	  {
+ 	    client_send_multiple ();
+            CLI.terminated = true;
+            pthread_join (client_rcv_thread_id, NULL);
+	  }
           shutdown_client ();
 	}
 

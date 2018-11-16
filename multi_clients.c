@@ -44,6 +44,7 @@ struct client_stuff {
   int sock;
   bool terminated;
   unsigned int send_count;
+  unsigned int rcv_count;
   const char *msg;
   struct connection rcv_connection;
 } CLI;
@@ -87,6 +88,7 @@ void init_client_stuff (void)
   CLI.sock = -1;
   CLI.terminated = false;
   CLI.send_count = 0;
+  CLI.rcv_count = 0;
   CLI.msg = NULL;
   init_connection (&CLI.rcv_connection);
 }
@@ -518,8 +520,10 @@ int client_receive (struct connection *conn)
     return rtn;
   while (true) {
     rtn = receive_msg_data (conn, NULL, &CLI.terminated);
-    if (rtn == 1)
+    if (rtn == 1) {
+      CLI.rcv_count++;
       return 0;
+    }
     if (rtn < 0)
       break;
   }
@@ -695,7 +699,7 @@ static int create_thread (pthread_t *tid, void *(*thread_func) (void*))
 static void *client_receiver_thread (void *arg)
 {
   int rtn;
-  printf ("Started client receiver thread for %d\n", getpid());
+  //printf ("Started client receiver thread for %d\n", getpid());
   while (true) {
     rtn = client_receive (&CLI.rcv_connection);
     if (rtn != 0)
@@ -704,7 +708,7 @@ static void *client_receiver_thread (void *arg)
     free (CLI.rcv_connection.rcv_msg);
     CLI.rcv_connection.rcv_msg = NULL;
   }
-  printf ("Ending client receiver thread for %d\n", getpid());
+  //printf ("Ending client receiver thread for %d\n", getpid());
 }
 
 void server_send_pass (socket_list_t *sent_list, socket_list_t *err_list,
@@ -822,8 +826,10 @@ void client_send_multiple (void)
   printf ("Sending %lu messages from pid %d\n", CLI.send_count, getpid());
 
 	for (i=0; i<CLI.send_count; i++) {
-	  if (i==100) // allow other senders to catch up
-            wait_msecs (2000);
+	  //if (i==100) // allow other senders to catch up
+          //  wait_msecs (2000);
+	  if ((i>0) && (CLI.rcv_count == 0))
+	    wait_msecs (250);
 	  else if (OPT.send_random)
 	    wait_random ();
 	  make_filled_msg (CLI.msg, i, buf);

@@ -523,7 +523,7 @@ int receive_msg_data (struct connection *conn, process_message_t handle_msg,
   return 1;
 }
 
-int client_receive (int sock, char **msg, size_t *sz_msg, bool *terminated)
+ssize_t client_receive (int sock, char **msg, bool *terminated)
 {
   int rtn;
   struct connection conn;
@@ -531,7 +531,6 @@ int client_receive (int sock, char **msg, size_t *sz_msg, bool *terminated)
   init_connection (&conn);
   conn.sock = sock;
   conn.rcv_state = 0;
-  *sz_msg = 0;
 
   rtn = receive_msg_header (&conn, terminated);
   if (rtn < 0)
@@ -540,8 +539,7 @@ int client_receive (int sock, char **msg, size_t *sz_msg, bool *terminated)
     rtn = receive_msg_data (&conn, NULL, terminated);
     if (rtn == 1) {
       *msg = conn.rcv_msg;
-      *sz_msg = conn.rcv_msg_size;
-      return 0;
+      return (ssize_t) conn.rcv_msg_size;
     }
     if (rtn < 0)
       break;
@@ -722,12 +720,11 @@ static int create_thread (pthread_t *tid, void *(*thread_func) (void*))
 
 static void *client_receiver_thread (void *arg)
 {
-  int rtn;
+  ssize_t rtn;
   //printf ("Started client receiver thread for %d\n", getpid());
   while (true) {
-    rtn = client_receive (CLI.sock, &CLI.rcv_msg, &CLI.rcv_msg_size, 
-      &CLI.terminated);
-    if (rtn != 0)
+    rtn = client_receive (CLI.sock, &CLI.rcv_msg, &CLI.terminated);
+    if (rtn < 0)
       break;
     CLI.rcv_count++;
     printf ("Client %d received: %s\n", getpid(), CLI.rcv_msg);

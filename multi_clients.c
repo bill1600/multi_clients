@@ -55,7 +55,8 @@ struct client_stuff {
   unsigned int send_count;
   unsigned int rcv_count;
   const char *msg;
-  struct connection rcv_connection;
+  char *rcv_msg;
+  size_t rcv_msg_size;
 } CLI;
 
 struct server_stuff {
@@ -99,7 +100,8 @@ void init_client_stuff (void)
   CLI.send_count = 0;
   CLI.rcv_count = 0;
   CLI.msg = NULL;
-  init_connection (&CLI.rcv_connection);
+  CLI.rcv_msg = NULL;
+  CLI.rcv_msg_size = 0;
 }
 
 void init_server_stuff (void)
@@ -159,6 +161,7 @@ int wait_server_ready (void)
         FD_SET (sock, &fds);
       }
     }
+    FD_SET (STDIN_FILENO, &fds);
     rtn = select (highest_sock+1, &fds, NULL, NULL, &timeout);
     if (rtn < 0) {
       printf ("Error on select for receive\n");
@@ -166,7 +169,7 @@ int wait_server_ready (void)
     }
     if (rtn != 0)
       break;
-    printf ("Waiting for receive\n");
+    printf ("Waiting for receive. Press <Enter> to terminate.\n");
   }
   rtn = 0;
   if (SRV.listen_sock != -1)
@@ -179,6 +182,8 @@ int wait_server_ready (void)
         rtn |= 2;
       }
   }
+  if (FD_ISSET (STDIN_FILENO, &fds))
+    rtn |= 4;
   return rtn;
 }
 
@@ -518,21 +523,24 @@ int receive_msg_data (struct connection *conn, process_message_t handle_msg,
   return 1;
 }
 
-int client_receive (struct connection *conn)
+int client_receive (int sock, char **msg, size_t *sz_msg, bool *terminated)
 {
   int rtn;
+  struct connection conn;
 
-  init_connection (conn);
-  conn->sock = CLI.sock;
-  conn->rcv_state = 0;
+  init_connection (&conn);
+  conn.sock = sock;
+  conn.rcv_state = 0;
+  *sz_msg = 0;
 
-  rtn = receive_msg_header (conn, &CLI.terminated);
+  rtn = receive_msg_header (&conn, terminated);
   if (rtn < 0)
     return rtn;
   while (true) {
-    rtn = receive_msg_data (conn, NULL, &CLI.terminated);
+    rtn = receive_msg_data (&conn, NULL, terminated);
     if (rtn == 1) {
-      CLI.rcv_count++;
+      *msg = conn.rcv_msg;
+      *sz_msg = conn.rcv_msg_size;
       return 0;
     }
     if (rtn < 0)
@@ -583,6 +591,7 @@ int server_receive_msgs (process_message_t handle_msg)
 void wait_for_msgs (process_message_t handle_msg)
 {
   int rtn;
+  char inbuf[10];
 
   while (1)
   {
@@ -593,19 +602,20 @@ void wait_for_msgs (process_message_t handle_msg)
 	    if (server_accept () < 0)
 	      break;
 	  if (rtn & 2) {
-	    rtn = server_receive_msgs (handle_msg);
-	    if (rtn != 0)
-	      break; 
+	    server_receive_msgs (handle_msg);
           }
+	  if (rtn & 4) { // key pressed
+	    fgets (inbuf, 10, stdin);
+	    break;
+	  }
   }
   SRV.terminated = true;
   printf ("Exiting wait_for_msgs\n");
 }
 
-int send_msg (int sock, const char *msg, bool non_block)
+int send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
 {
   int flags = 0;
-  int sz_msg = strlen (msg) + 1; // '\0' too
   ssize_t bytes;
   int i;
   char *msg_buf;
@@ -715,12 +725,14 @@ static void *client_receiver_thread (void *arg)
   int rtn;
   //printf ("Started client receiver thread for %d\n", getpid());
   while (true) {
-    rtn = client_receive (&CLI.rcv_connection);
+    rtn = client_receive (CLI.sock, &CLI.rcv_msg, &CLI.rcv_msg_size, 
+      &CLI.terminated);
     if (rtn != 0)
       break;
-    printf ("Client %d received: %s\n", getpid(), CLI.rcv_connection.rcv_msg);
-    free (CLI.rcv_connection.rcv_msg);
-    CLI.rcv_connection.rcv_msg = NULL;
+    CLI.rcv_count++;
+    printf ("Client %d received: %s\n", getpid(), CLI.rcv_msg);
+    free (CLI.rcv_msg);
+    CLI.rcv_msg = NULL;
   }
   //printf ("Ending client receiver thread for %d\n", getpid());
 }
@@ -728,6 +740,7 @@ static void *client_receiver_thread (void *arg)
 void server_send_pass (socket_list_t *done_list, socket_list_t *not_done_list,
   const char *msg)
 {
+  size_t sz_msg = strlen(msg) + 1;
   bool found = false;
   struct connection *conn;
 
@@ -748,7 +761,7 @@ void server_send_pass (socket_list_t *done_list, socket_list_t *not_done_list,
         append_to_socket_list (not_done_list, conn->sock);
         break;
       }
-      if (send_msg (conn->sock, msg, true) == 0)
+      if (send_msg (conn->sock, msg, sz_msg, true) == 0)
         append_to_socket_list (done_list, conn->sock);
       else
         append_to_socket_list (not_done_list, conn->sock);
@@ -835,6 +848,7 @@ void make_filled_msg (const char *msg, unsigned msg_num, char *filled_msg)
 void client_send_multiple (void)
 {
   unsigned long i;
+  size_t sz_msg;
   char buf[msg_buf_size+OPT.msg_filler];
 
   if (CLI.send_count == 0)
@@ -843,14 +857,15 @@ void client_send_multiple (void)
   printf ("Sending %lu messages from pid %d\n", CLI.send_count, getpid());
 
   for (i=0; i<CLI.send_count; i++) {
-	  //if (i==100) // allow other senders to catch up
-          //  wait_msecs (2000);
+    //if (i==100) // allow other senders to catch up
+    //  wait_msecs (2000);
 	  if ((i>0) && (CLI.rcv_count == 0))
 	    wait_msecs (250);
 	  else if (OPT.send_random)
 	    wait_random ();
 	  make_filled_msg (CLI.msg, i, buf);
-	  if (send_msg(CLI.sock, buf, false) != 0)
+	  sz_msg = strlen(buf) + 1;
+	  if (send_msg(CLI.sock, buf, sz_msg, false) != 0)
 		break;
 	  if (OPT.print_send_msgs)
 	    printf ("Sent msg %lu\n", i);
@@ -1017,5 +1032,5 @@ int main (const int argc, const char **argv)
 	}
 
 
-  printf ("Done!\n");
+  printf ("%d Done!\n", getpid());
 }

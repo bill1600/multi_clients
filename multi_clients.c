@@ -38,6 +38,7 @@ size_t msg_buf_size = 128;
 
 typedef struct connection {
   int sock;
+  int oserr;
   int rcv_state;
   unsigned rcv_count;
   bool rcv_selected;
@@ -47,16 +48,27 @@ typedef struct connection {
   struct connection * next;
 } connection_t;
 
-struct client_stuff {
-  const char *port_str;
+typedef struct client_conn {
   struct sockaddr_in addr;
   int sock;
-  bool terminated;
-  unsigned int send_count;
-  unsigned int rcv_count;
-  const char *msg;
+  int oserr;
   char *rcv_msg;
   size_t rcv_msg_size;
+  unsigned int rcv_count;
+  bool terminated;
+} client_conn_t;
+
+struct client_stuff {
+  const char *port_str;
+  //struct sockaddr_in addr;
+  //int sock;
+  //bool terminated;
+  unsigned int send_count;
+  //unsigned int rcv_count;
+  const char *send_msg;
+  //char *rcv_msg;
+  //size_t rcv_msg_size;
+  struct client_conn conn;
 } CLI;
 
 struct server_stuff {
@@ -80,9 +92,11 @@ void init_options (void)
   OPT.msg_filler = 0;
 }
 
+
 void init_connection (struct connection *conn)
 {
   conn->sock = -1;
+  conn->oserr = 0;
   conn->rcv_state = -1;
   conn->rcv_count = 0;
   conn->rcv_selected = false;
@@ -92,16 +106,27 @@ void init_connection (struct connection *conn)
   conn->next = NULL;
 }
 
+void init_client_conn (struct client_conn *conn)
+{
+  conn->sock = -1;
+  conn->oserr = 0;
+  conn->rcv_msg = NULL;
+  conn->rcv_msg_size = 0;
+  conn->rcv_count = 0;
+  conn->terminated = false;
+}
+
 void init_client_stuff (void)
 {
   CLI.port_str = NULL;
-  CLI.sock = -1;
-  CLI.terminated = false;
+  //CLI.sock = -1;
+  //CLI.terminated = false;
   CLI.send_count = 0;
-  CLI.rcv_count = 0;
-  CLI.msg = NULL;
-  CLI.rcv_msg = NULL;
-  CLI.rcv_msg_size = 0;
+  //CLI.rcv_count = 0;
+  //CLI.msg = NULL;
+  //CLI.rcv_msg = NULL;
+  //CLI.rcv_msg_size = 0;
+  init_client_conn (&CLI.conn);
 }
 
 void init_server_stuff (void)
@@ -232,20 +257,20 @@ int make_sockaddr (struct sockaddr_in *addr, const char *id, bool rcv_any)
 
 int connect_server (void)
 {
-	int sock, flags;
+	int sock, flags, rtn;
 	int reuse_opt = 1;
 
 	if (NULL == SRV.port_str) {
 		SRV.listen_sock = -1;
-		return -1;
+		return EINVAL;
 	}
 
 	if (make_sockaddr (&SRV.addr, SRV.port_str, false) != 0)
-          return -1;
+          return EINVAL;
 	sock = socket (AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		dbg_err (errno, "Unable to create rcv socket\n");
- 		return -1;
+ 		return errno;
 	}
 #if 0
 	flags = fcntl (sock, F_GETFL);
@@ -264,13 +289,15 @@ int connect_server (void)
 	if (bind (sock, (struct sockaddr *) &SRV.addr, 
           sizeof (struct sockaddr_in)) < 0) {
 		dbg_err (errno, "Unable to bind to receive socket %s\n");
+		rtn = errno;
 		close (sock);
-		return -1;
+		return rtn;
 	}
 	if (listen (sock, 50) == -1) {
 	  dbg_err (errno, "Listen error on receive socket: %s\n");
+	  rtn = errno;
 	  close (sock);
-	  return -1;
+	  return rtn;
 	}
 	SRV.listen_sock = sock;
 	return 0;
@@ -287,7 +314,7 @@ int server_accept (void)
       return 1;
     dbg_err (errno, "Accept error on receive socket: %s\n");
     close (SRV.listen_sock);
-    return -1;
+    return 2;
   }
   printf ("Accepted %d\n", sock);
 #if 0
@@ -351,21 +378,24 @@ void shutdown_server (void)
   }
 }
 
-int connect_client (void)
+int connect_client (struct client_conn *conn, const char *port_str)
 {
 	int sock;
 	int reuse_opt = 1;
 	struct timeval send_timeout;
 	struct timeval rcv_timeout;
 
-	if (NULL == CLI.port_str) {
-		CLI.sock = -1;
+	init_client_conn (conn);
+
+	if (NULL == port_str) {
+		conn->sock = -1;
 		return -1;
 	}
-	if (make_sockaddr (&CLI.addr, CLI.port_str, false) != 0)
+	if (make_sockaddr (&conn->addr, port_str, false) != 0)
           return -1;
 	sock = socket (AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
+		conn->oserr = errno;
 		dbg_err (errno, "Unable to create send socket\n");
  		return -1;
 	}
@@ -374,6 +404,7 @@ int connect_client (void)
 	if (OPT.set_timeout)
 		if (setsockopt (sock, SOL_SOCKET, SO_SNDTIMEO, 
 		  &send_timeout, sizeof (send_timeout)) < 0) {
+			conn->oserr = errno;
 			dbg_err (errno, "Unable to set socket send timeout: \n");
 			close (sock);
 	 		return -1;
@@ -382,25 +413,28 @@ int connect_client (void)
 	rcv_timeout.tv_usec = 500000;
 	if (setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, 
 		  &rcv_timeout, sizeof (rcv_timeout)) < 0) {
+			conn->oserr = errno;
 			dbg_err (errno, "Unable to set socket rcv timeout: \n");
 			close (sock);
 	 		return -1;
 		}
-	if (connect (sock, (struct sockaddr *) &CLI.addr, sizeof (CLI.addr)) < 0) {
+	if (connect (sock, (struct sockaddr *) &conn->addr, sizeof (conn->addr)) < 0) {
+		conn->oserr = errno;
 		dbg_err (errno, "Unable to connect to client socket\n");
-		shutdown (CLI.sock, SHUT_RDWR);
-		close (CLI.sock);
+		shutdown (sock, SHUT_RDWR);
+		close (sock);
 		return -1;
 	}
-	CLI.sock = sock;
+	conn->sock = sock;
 	return 0;
 }
 
-void shutdown_client (void)
+void shutdown_client (struct client_conn *conn)
 {
-	if (CLI.sock != -1) {
-		shutdown_sock (CLI.sock);
-	}
+  if (conn->sock != -1) {
+	shutdown_sock (conn->sock);
+	conn->sock = -1;
+  }
 }
 
 
@@ -431,12 +465,12 @@ int wait_send_ready (int sock)
 }
 #endif
 
-ssize_t socket_receive (int sock, void *buf, size_t len, bool *terminated)
+ssize_t socket_receive (struct connection *conn, void *buf, size_t len, bool *terminated)
 {
   ssize_t bytes;
 
   while (true) {
-    bytes = recv (sock, buf, len, 0);
+    bytes = recv (conn->sock, buf, len, 0);
     if (bytes >= 0)
       return bytes;
     if (NULL != terminated) {
@@ -446,6 +480,7 @@ ssize_t socket_receive (int sock, void *buf, size_t len, bool *terminated)
         continue; 
       }
     }
+    conn->oserr = errno;
     return -1;
   }
 }
@@ -457,10 +492,10 @@ int receive_msg_header (struct connection *conn, bool *terminated)
   size_t msg_size;
   unsigned char header[4];
 
-  bytes = socket_receive (sock, header, 4, terminated);
+  bytes = socket_receive (conn, header, 4, terminated);
   if (bytes < 0) { 
     if (bytes == -1)
-      dbg_err (errno, "Error receiving msg header\n");
+      dbg_err (conn->oserr, "Error receiving msg header\n");
     return bytes;
   }
   if (bytes == 0) {
@@ -497,11 +532,11 @@ int receive_msg_data (struct connection *conn, process_message_t handle_msg,
   int sock = conn->sock;
   char *buf = conn->rcv_msg;
 
-  bytes = socket_receive (sock, buf+conn->rcv_end_pos, read_len, terminated);
+  bytes = socket_receive (conn, buf+conn->rcv_end_pos, read_len, terminated);
 
   if (bytes < 0) { 
     if (bytes == -1)
-      dbg_err (errno, "Error receiving msg header\n");
+      dbg_err (conn->oserr, "Error receiving msg header\n");
     return bytes;
   }
 
@@ -523,23 +558,25 @@ int receive_msg_data (struct connection *conn, process_message_t handle_msg,
   return 1;
 }
 
-ssize_t client_receive (int sock, char **msg, bool *terminated)
+ssize_t client_receive (struct client_conn *cconn)
 {
   int rtn;
-  struct connection conn;
+  struct connection rconn;
 
-  init_connection (&conn);
-  conn.sock = sock;
-  conn.rcv_state = 0;
+  init_connection (&rconn);
+  rconn.sock = cconn->sock;
+  rconn.rcv_state = 0;
 
-  rtn = receive_msg_header (&conn, terminated);
+  rtn = receive_msg_header (&rconn, &cconn->terminated);
   if (rtn < 0)
     return rtn;
   while (true) {
-    rtn = receive_msg_data (&conn, NULL, terminated);
+    rtn = receive_msg_data (&rconn, NULL, &cconn->terminated);
     if (rtn == 1) {
-      *msg = conn.rcv_msg;
-      return (ssize_t) conn.rcv_msg_size;
+      cconn->rcv_msg = rconn.rcv_msg;
+      cconn->rcv_msg_size = rconn.rcv_msg_size; 
+      cconn->rcv_count++;
+      return (ssize_t) rconn.rcv_msg_size;
     }
     if (rtn < 0)
       break;
@@ -597,17 +634,14 @@ void wait_for_msgs (process_message_t handle_msg)
 	  if (rtn < 0)
 	    break;
 	  if (rtn & 1)
-	    if (server_accept () < 0)
-	      break;
-	  if (rtn & 2) {
+	    server_accept ();
+	  if (rtn & 2)
 	    server_receive_msgs (handle_msg);
-          }
 	  if (rtn & 4) { // key pressed
 	    fgets (inbuf, 10, stdin);
 	    break;
 	  }
   }
-  SRV.terminated = true;
   printf ("Exiting wait_for_msgs\n");
 }
 
@@ -621,13 +655,13 @@ int send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
   msg_buf = malloc (sz_msg+4);
   if (NULL == msg_buf) {
     printf ("Unable to malloc msg buffer for socket %d\n", sock);
-    return -1;
+    return ENOMEM;
   }
   msg_buf[0] = MSG_HEADER_MARK;
   msg_buf[1] = MSG_HEADER_MARK;
   msg_buf[2] = sz_msg / 256;
   msg_buf[3] = sz_msg % 256;
-  strcpy (msg_buf+4, msg);
+  memcpy (msg_buf+4, msg, sz_msg);
 
 #if 0
   if (wait_send_ready () < 0)
@@ -640,11 +674,11 @@ int send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
   free (msg_buf);
   if (bytes < 0) { 
 	dbg_err (errno, "Error sending msg\n");
-	return -1;
+	return errno;
   }
   if (bytes != sz_msg) {
 	printf ("Not all bytes sent, just %d\n", bytes);
-	return -1;
+	return EIO;
   }
   return 0;
 }
@@ -721,15 +755,15 @@ static int create_thread (pthread_t *tid, void *(*thread_func) (void*))
 static void *client_receiver_thread (void *arg)
 {
   ssize_t rtn;
+
   //printf ("Started client receiver thread for %d\n", getpid());
   while (true) {
-    rtn = client_receive (CLI.sock, &CLI.rcv_msg, &CLI.terminated);
+    rtn = client_receive (&CLI.conn);
     if (rtn < 0)
       break;
-    CLI.rcv_count++;
-    printf ("Client %d received: %s\n", getpid(), CLI.rcv_msg);
-    free (CLI.rcv_msg);
-    CLI.rcv_msg = NULL;
+    printf ("Client %d received: %s\n", getpid(), CLI.conn.rcv_msg);
+    free (CLI.conn.rcv_msg);
+    CLI.conn.rcv_msg = NULL;
   }
   //printf ("Ending client receiver thread for %d\n", getpid());
 }
@@ -856,13 +890,13 @@ void client_send_multiple (void)
   for (i=0; i<CLI.send_count; i++) {
     //if (i==100) // allow other senders to catch up
     //  wait_msecs (2000);
-	  if ((i>0) && (CLI.rcv_count == 0))
+	  if ((i>0) && (CLI.conn.rcv_count == 0))
 	    wait_msecs (250);
 	  else if (OPT.send_random)
 	    wait_random ();
-	  make_filled_msg (CLI.msg, i, buf);
+	  make_filled_msg (CLI.send_msg, i, buf);
 	  sz_msg = strlen(buf) + 1;
-	  if (send_msg(CLI.sock, buf, sz_msg, false) != 0)
+	  if (send_msg(CLI.conn.sock, buf, sz_msg, false) != 0)
 		break;
 	  if (OPT.print_send_msgs)
 	    printf ("Sent msg %lu\n", i);
@@ -950,7 +984,7 @@ int get_args (const int argc, const char **argv)
 			continue;
 		}
 		if (mode == 'm') {
-			CLI.msg = arg;
+			CLI.send_msg = arg;
 			mode = 0;
 			continue;
 		}
@@ -985,7 +1019,7 @@ int main (const int argc, const char **argv)
 	if (get_args(argc, argv) != 0)
 		exit (4);
 
-	if ((NULL != CLI.msg) && (NULL == CLI.port_str)) {
+	if ((NULL != CLI.send_msg) && (NULL == CLI.port_str)) {
 		printf ("msg specified witlhout a sender ID\n");
 		exit(4);
 	}
@@ -1001,11 +1035,12 @@ int main (const int argc, const char **argv)
 	}
 
 	if (NULL != SRV.port_str) {
-	  if (connect_server () < 0)
+	  if (connect_server () != 0)
 		exit(4);
 	  if (create_thread (&server_send_thread_id, server_send_thread) == 0)
 	  {
 	    wait_for_msgs (process_rcv_msg);
+	    SRV.terminated = true;
 	    pthread_join (server_send_thread_id, NULL);
 	  }
 	  shutdown_server ();
@@ -1013,19 +1048,19 @@ int main (const int argc, const char **argv)
 	}
 
 	if (NULL != CLI.port_str) {
-	  if (NULL == CLI.msg) {
+	  if (NULL == CLI.send_msg) {
 		printf ("Message not specified for client\n");
 		exit(4);
 	  }
-	  if (connect_client () < 0)
+	  if (connect_client (&CLI.conn, CLI.port_str) < 0)
 		exit(4);
 	  if (create_thread (&client_rcv_thread_id, client_receiver_thread) == 0)
 	  {
  	    client_send_multiple ();
-            CLI.terminated = true;
+            CLI.conn.terminated = true;
             pthread_join (client_rcv_thread_id, NULL);
 	  }
-          shutdown_client ();
+          shutdown_client (&CLI.conn);
 	}
 
 

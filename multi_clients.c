@@ -24,7 +24,7 @@
 
 #define SOCK_SEND_TIMEOUT_SEC 2
 #define MSG_HEADER_MARK 0xEE
-
+#define IP_ADDR "127.0.0.1"
 
 struct options {
   bool set_timeout;
@@ -60,14 +60,8 @@ typedef struct client_conn {
 
 struct client_stuff {
   const char *port_str;
-  //struct sockaddr_in addr;
-  //int sock;
-  //bool terminated;
   unsigned int send_count;
-  //unsigned int rcv_count;
   const char *send_msg;
-  //char *rcv_msg;
-  //size_t rcv_msg_size;
   struct client_conn conn;
 } CLI;
 
@@ -119,13 +113,7 @@ void init_client_conn (struct client_conn *conn)
 void init_client_stuff (void)
 {
   CLI.port_str = NULL;
-  //CLI.sock = -1;
-  //CLI.terminated = false;
   CLI.send_count = 0;
-  //CLI.rcv_count = 0;
-  //CLI.msg = NULL;
-  //CLI.rcv_msg = NULL;
-  //CLI.rcv_msg_size = 0;
   init_client_conn (&CLI.conn);
 }
 
@@ -233,11 +221,12 @@ unsigned int parse_num_arg (const char *arg, const char *arg_name)
 	return result;
 }
 
-int make_sockaddr (struct sockaddr_in *addr, const char *id, bool rcv_any)
+int make_sockaddr (struct sockaddr_in *addr, 
+  const char *ip_addr, const char *port_str, bool rcv_any)
 {
   int rtn;
   unsigned int port;
-  port = parse_num_arg (id, "port");
+  port = parse_num_arg (port_str, "port");
   if (port == (unsigned) -1)
     return -1;
   
@@ -246,7 +235,7 @@ int make_sockaddr (struct sockaddr_in *addr, const char *id, bool rcv_any)
   if (rcv_any)
     addr->sin_addr.s_addr = INADDR_ANY;
   else {
-    rtn = inet_pton (AF_INET, "127.0.0.1", &addr->sin_addr);
+    rtn = inet_pton (AF_INET, ip_addr, &addr->sin_addr);
     if (rtn != 1) {
       printf ("inet_pton error\n");
       return -1;
@@ -255,17 +244,17 @@ int make_sockaddr (struct sockaddr_in *addr, const char *id, bool rcv_any)
   return 0;
 }
 
-int connect_server (void)
+int connect_server (const char *ip_addr, const char *port_str)
 {
 	int sock, flags, rtn;
 	int reuse_opt = 1;
 
-	if (NULL == SRV.port_str) {
+	if ((NULL == ip_addr) || (NULL == port_str)) {
 		SRV.listen_sock = -1;
 		return EINVAL;
 	}
 
-	if (make_sockaddr (&SRV.addr, SRV.port_str, false) != 0)
+	if (make_sockaddr (&SRV.addr, ip_addr, port_str, false) != 0)
           return EINVAL;
 	sock = socket (AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
@@ -378,7 +367,8 @@ void shutdown_server (void)
   }
 }
 
-int connect_client (struct client_conn *conn, const char *port_str)
+int connect_client (struct client_conn *conn, 
+  const char *ip_addr, const char *port_str)
 {
 	int sock;
 	int reuse_opt = 1;
@@ -391,7 +381,7 @@ int connect_client (struct client_conn *conn, const char *port_str)
 		conn->sock = -1;
 		return -1;
 	}
-	if (make_sockaddr (&conn->addr, port_str, false) != 0)
+	if (make_sockaddr (&conn->addr, ip_addr, port_str, false) != 0)
           return -1;
 	sock = socket (AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
@@ -437,33 +427,6 @@ void shutdown_client (struct client_conn *conn)
   }
 }
 
-
-#if 0
-int wait_send_ready (int sock)
-{
-  struct timeval timeout;
-  int rtn;
-  fd_set fds;
-
-  if (!OPT.wait_send_ready)
-    return 0;
-  while (1)
-  {
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
-    FD_ZERO (&fds);
-    FD_SET (sock, &fds);
-    rtn = select (sock+1, NULL, &fds, NULL, &timeout);
-    if (rtn < 0) {
-      printf ("Error on select for send\n");
-      return -1;
-    }
-    if (rtn != 0)
-      return 0;
-    printf ("Waiting for send\n");
-  }
-}
-#endif
 
 ssize_t socket_receive (struct connection *conn, void *buf, size_t len, bool *terminated)
 {
@@ -1035,7 +998,7 @@ int main (const int argc, const char **argv)
 	}
 
 	if (NULL != SRV.port_str) {
-	  if (connect_server () != 0)
+	  if (connect_server (IP_ADDR, SRV.port_str) != 0)
 		exit(4);
 	  if (create_thread (&server_send_thread_id, server_send_thread) == 0)
 	  {
@@ -1052,7 +1015,7 @@ int main (const int argc, const char **argv)
 		printf ("Message not specified for client\n");
 		exit(4);
 	  }
-	  if (connect_client (&CLI.conn, CLI.port_str) < 0)
+	  if (connect_client (&CLI.conn, IP_ADDR, CLI.port_str) < 0)
 		exit(4);
 	  if (create_thread (&client_rcv_thread_id, client_receiver_thread) == 0)
 	  {

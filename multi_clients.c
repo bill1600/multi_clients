@@ -69,7 +69,9 @@ struct server_stuff {
   const char *port_str;
   struct sockaddr_in addr;
   int listen_sock;
-  bool terminated;
+  bool send_process_terminated;
+  bool terminate_on_keypress;
+  const char *waiting_msg;
   pthread_mutex_t list_mutex;
   struct connection * connection_list;
 } SRV;
@@ -121,7 +123,10 @@ void init_server_stuff (void)
 {
   SRV.port_str = NULL;
   SRV.listen_sock = -1;
-  SRV.terminated = false;
+  SRV.send_process_terminated = false;
+  SRV.terminate_on_keypress = true;
+  SRV.waiting_msg = "Waiting for receive. Press <Enter> to terminate.\n";
+
   pthread_mutex_init (&SRV.list_mutex, NULL);
   SRV.connection_list = NULL;
 }
@@ -144,20 +149,21 @@ void wait_msecs (unsigned msecs)
   select (0, NULL, NULL, NULL, &timeout);
 }
 
-int wait_server_ready (void)
+int wait_server_ready (bool *terminated)
 {
   struct timeval timeout;
   struct connection *conn;
   int i, rtn, sock, highest_sock;
   int fd = SRV.listen_sock;
+  int timeout_count = 0;
   fd_set fds;
 
   highest_sock = -1;
 
   while (1)
   {
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 500000;
     FD_ZERO (&fds);
     if (SRV.listen_sock != -1) {
       FD_SET (SRV.listen_sock, &fds);
@@ -174,7 +180,9 @@ int wait_server_ready (void)
         FD_SET (sock, &fds);
       }
     }
-    FD_SET (STDIN_FILENO, &fds);
+    if (SRV.terminate_on_keypress) {
+      FD_SET (STDIN_FILENO, &fds);
+    }
     rtn = select (highest_sock+1, &fds, NULL, NULL, &timeout);
     if (rtn < 0) {
       printf ("Error on select for receive\n");
@@ -182,7 +190,14 @@ int wait_server_ready (void)
     }
     if (rtn != 0)
       break;
-    printf ("Waiting for receive. Press <Enter> to terminate.\n");
+    if (NULL != terminated)
+      if (*terminated)
+        break;
+    if (NULL != SRV.waiting_msg) {
+      ++timeout_count;
+      if ((timeout_count & 3) == 0)
+        printf (SRV.waiting_msg);
+    }
   }
   rtn = 0;
   if (SRV.listen_sock != -1)
@@ -195,8 +210,10 @@ int wait_server_ready (void)
         rtn |= 2;
       }
   }
-  if (FD_ISSET (STDIN_FILENO, &fds))
-    rtn |= 4;
+  if (SRV.terminate_on_keypress) {
+    if (FD_ISSET (STDIN_FILENO, &fds))
+      rtn |= 4;
+  }
   return rtn;
 }
 
@@ -586,24 +603,29 @@ int server_receive_msgs (process_message_t handle_msg)
 }
 
 
-void wait_for_msgs (process_message_t handle_msg)
+void wait_for_msgs (process_message_t handle_msg, bool *terminated)
 {
   int rtn;
   char inbuf[10];
 
   while (1)
   {
-	  rtn = wait_server_ready ();
+	  rtn = wait_server_ready (terminated);
 	  if (rtn < 0)
 	    break;
 	  if (rtn & 1)
 	    server_accept ();
 	  if (rtn & 2)
 	    server_receive_msgs (handle_msg);
-	  if (rtn & 4) { // key pressed
-	    fgets (inbuf, 10, stdin);
-	    break;
+	  if (SRV.terminate_on_keypress) {
+	    if (rtn & 4) { // key pressed
+	      fgets (inbuf, 10, stdin);
+	      break;
+	    }
 	  }
+	  if (NULL != terminated)
+            if (*terminated)
+	      break;
   }
   printf ("Exiting wait_for_msgs\n");
 }
@@ -767,7 +789,8 @@ void server_send_pass (socket_list_t *done_list, socket_list_t *not_done_list,
   }
 }
 
-int server_send_to_all_clients (const char *msg, unsigned timeout_ms)
+int server_send_to_all_clients (const char *msg, unsigned timeout_ms,
+  bool *terminated)
 {
   int rtn;
   socket_list_t done_list;
@@ -778,12 +801,12 @@ int server_send_to_all_clients (const char *msg, unsigned timeout_ms)
   init_socket_list (&done_list);
   init_socket_list (&not_done_list);
   
-  while (!server_received_something && !SRV.terminated)
+  while (!server_received_something && !*terminated)
     wait_msecs (250);
 
   server_send_pass (&done_list, &not_done_list, msg);
 
-  while (!SRV.terminated) {
+  while (!*terminated) {
     if (delay == 0)
       delay = 10;
     else if (delay == 10)
@@ -824,7 +847,8 @@ static void *server_send_thread (void *arg)
   int i, rtn;
 
   printf ("Starting server send thread\n");
-  rtn = server_send_to_all_clients ("Hello from the server!", 1000);
+  rtn = server_send_to_all_clients ("Hello from the server!", 1000,
+    &SRV.send_process_terminated);
   if (0 != rtn)
     printf ("Messages not sent to %d clients\n", rtn);
   printf ("Ending server send thread\n");
@@ -1002,8 +1026,8 @@ int main (const int argc, const char **argv)
 		exit(4);
 	  if (create_thread (&server_send_thread_id, server_send_thread) == 0)
 	  {
-	    wait_for_msgs (process_rcv_msg);
-	    SRV.terminated = true;
+	    wait_for_msgs (process_rcv_msg, NULL);
+	    SRV.send_process_terminated = true;
 	    pthread_join (server_send_thread_id, NULL);
 	  }
 	  shutdown_server ();

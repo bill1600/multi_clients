@@ -33,6 +33,8 @@ typedef struct client_conn {
   size_t rcv_msg_size;
   unsigned int rcv_count;
   bool terminated;
+  pthread_mutex_t send_mutex;
+  pthread_mutex_t rcv_mutex;
 } client_conn_t;
 
 typedef struct server_opts {
@@ -44,10 +46,14 @@ typedef struct server_rcv_msg_data {
   int sock;
   char *rcv_msg;
   size_t rcv_msg_size;
-  unsigned int rcv_count;
 } server_rcv_msg_data_t;
 
-typedef void (* process_message_t) (server_rcv_msg_data_t *rcv_msg_data);
+#define CMSG_ACTION_MSG_RECEIVED	0
+#define CMSG_ACTION_CONN_ADDED		1
+#define CMSG_ACTION_CONN_DROPPED	2
+
+typedef void (* process_message_t) 
+    (int action_code, server_rcv_msg_data_t *rcv_msg_data);
 
 /*----------------------------------------------------------------------------*/
 /*                             Function Prototypes                            */
@@ -55,16 +61,19 @@ typedef void (* process_message_t) (server_rcv_msg_data_t *rcv_msg_data);
 
 int cmsg_connect_server (const char *ip_addr, unsigned int port, 
   server_opts_t *options);
-void cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated);
-// Will exit and shutdown server if terminated flag is set
+int cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated);
+// Will exit and shutdown server if terminated flag is set,
+// or if option terminate_on_keypress specified and a key is pressed
+int cmsg_server_send (int sock, const char *msg, size_t sz_msg, bool non_block);
 
+void init_client_conn (struct client_conn *conn);
 int cmsg_connect_client (struct client_conn *conn, 
   const char *ip_addr, unsigned int port, unsigned int send_timeout_msecs);
 void cmsg_shutdown_client (struct client_conn *conn);
+// will set conn->terminated
 ssize_t cmsg_client_receive (struct client_conn *conn);
 // will return -1 if conn->terminated is set
-
-int cmsg_send_msg (int sock, const char *msg, size_t sz_msg, bool non_block);
+int cmsg_client_send (struct client_conn *conn, const char *msg, size_t sz_msg, bool non_block);
 
 
 

@@ -23,7 +23,6 @@
 *  server send should be non-bocking so we can do send all
 ---------------------------------------------------------------------*/
 
-#define SOCK_SEND_TIMEOUT_SEC 2
 #define MSG_HEADER_MARK 0xEE
 
 
@@ -37,19 +36,22 @@ typedef struct connection {
 } connection_t;
 
 
-struct server_stuff {
+static struct server_stuff {
   unsigned int port;
   struct sockaddr_in addr;
   int listen_sock;
-  bool send_process_terminated;
   bool terminate_on_keypress;
+  bool is_listening;
   const char *waiting_msg;
+  pthread_mutex_t connect_mutex;
   pthread_mutex_t list_mutex;
   struct connection * connection_list;
 } SRV
  = { .port = (unsigned int) -1, .listen_sock = -1,
-     .send_process_terminated = false, .terminate_on_keypress = true,
+     .terminate_on_keypress = true,
+     .is_listening = false,
      .waiting_msg = "Waiting for receive. Press <Enter> to terminate.\n",
+     .connect_mutex = PTHREAD_MUTEX_INITIALIZER,
      .list_mutex = PTHREAD_MUTEX_INITIALIZER,
      .connection_list = NULL
    };
@@ -61,7 +63,6 @@ void init_connection (struct connection *conn)
   conn->rcv_data.sock = -1;
   conn->oserr = 0;
   conn->rcv_state = -1;
-  conn->rcv_data.rcv_count = 0;
   conn->rcv_selected = false;
   conn->rcv_data.rcv_msg_size = 0;
   conn->rcv_end_pos = 0;
@@ -77,6 +78,8 @@ void init_client_conn (struct client_conn *conn)
   conn->rcv_msg_size = 0;
   conn->rcv_count = 0;
   conn->terminated = false;
+  pthread_mutex_init (&conn->send_mutex, NULL);
+  pthread_mutex_init (&conn->rcv_mutex, NULL);
 }
 
 
@@ -148,27 +151,6 @@ int wait_server_ready (bool *terminated)
   return rtn;
 }
 
-unsigned int parse_num_arg (const char *arg, const char *arg_name)
-{
-	unsigned int result = 0;
-	int i;
-	char c;
-	
-	if (arg[0] == '\0') {
-		printf ("Empty %s argument\n", arg_name);
-		return (unsigned int) -1;
-	}
-	for (i=0; '\0' != (c=arg[i]); i++)
-	{
-		if ((c<'0') || (c>'9')) {
-			printf ("Non-numeric %s argument\n", arg_name);
-			return (unsigned int) -1;
-		}
-		result = (result*10) + c - '0';
-	}
-	return result;
-}
-
 int make_sockaddr (struct sockaddr_in *addr, 
   const char *ip_addr, unsigned int port, bool rcv_any)
 {
@@ -196,6 +178,12 @@ int cmsg_connect_server (const char *ip_addr, unsigned int port,
 	int sock, flags, rtn;
 	int reuse_opt = 1;
 
+	pthread_mutex_lock (&SRV.connect_mutex);
+	if (SRV.listen_sock != -1) {
+	  printf ("server already connected\n");
+	  pthread_mutex_unlock (&SRV.connect_mutex);
+	  return EALREADY;
+	}
 	if (NULL != options) {
 		SRV.terminate_on_keypress = options->terminate_on_keypress;
 		SRV.waiting_msg = options->waiting_msg;
@@ -203,14 +191,19 @@ int cmsg_connect_server (const char *ip_addr, unsigned int port,
 
 	if ((NULL == ip_addr) || ((unsigned int) -1 == port)) {
 		SRV.listen_sock = -1;
+		printf ("Invalid ip addr or port for cmsg_server_connect\n");
+		pthread_mutex_unlock (&SRV.connect_mutex);
 		return EINVAL;
 	}
 
-	if (make_sockaddr (&SRV.addr, ip_addr, port, false) != 0)
+	if (make_sockaddr (&SRV.addr, ip_addr, port, false) != 0) {
+	  pthread_mutex_unlock (&SRV.connect_mutex);
           return EINVAL;
+	}
 	sock = socket (AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
 		dbg_err (errno, "Unable to create rcv socket\n");
+		pthread_mutex_unlock (&SRV.connect_mutex);
  		return errno;
 	}
 #if 0
@@ -232,19 +225,22 @@ int cmsg_connect_server (const char *ip_addr, unsigned int port,
 		dbg_err (errno, "Unable to bind to receive socket %s\n");
 		rtn = errno;
 		close (sock);
+		pthread_mutex_unlock (&SRV.connect_mutex);
 		return rtn;
 	}
 	if (listen (sock, 50) == -1) {
 	  dbg_err (errno, "Listen error on receive socket: %s\n");
 	  rtn = errno;
 	  close (sock);
+	  pthread_mutex_unlock (&SRV.connect_mutex);
 	  return rtn;
 	}
 	SRV.listen_sock = sock;
+	pthread_mutex_unlock (&SRV.connect_mutex);
 	return 0;
 }
 
-int server_accept (void)
+int server_accept (process_message_t handle_msg)
 {
   int i, sock, flags;
   struct connection *conn;
@@ -282,6 +278,7 @@ int server_accept (void)
   conn->rcv_data.sock = sock;
   pthread_mutex_lock (&SRV.list_mutex);
   LL_APPEND (SRV.connection_list, conn);
+  handle_msg (CMSG_ACTION_CONN_ADDED, &conn->rcv_data);
   pthread_mutex_unlock (&SRV.list_mutex);
   return 0;
 
@@ -376,6 +373,8 @@ void cmsg_shutdown_client (struct client_conn *conn)
 {
   if (conn->sock != -1) {
 	shutdown_sock (conn->sock);
+	pthread_mutex_destroy (&conn->send_mutex);
+	pthread_mutex_destroy (&conn->rcv_mutex);
 	conn->sock = -1;
   }
 }
@@ -468,8 +467,7 @@ int receive_msg_data (struct connection *conn, process_message_t handle_msg,
     return 0;
   }
   if (NULL != handle_msg)
-    handle_msg (&conn->rcv_data);
-  conn->rcv_data.rcv_count += 1;
+    handle_msg (CMSG_ACTION_MSG_RECEIVED, &conn->rcv_data);
   conn->rcv_state = 0;
   return 1;
 }
@@ -479,24 +477,30 @@ ssize_t cmsg_client_receive (struct client_conn *cconn)
   int rtn;
   struct connection rconn;
 
+  pthread_mutex_lock (&cconn->rcv_mutex);
   init_connection (&rconn);
   rconn.rcv_data.sock = cconn->sock;
   rconn.rcv_state = 0;
 
   rtn = receive_msg_header (&rconn, &cconn->terminated);
-  if (rtn < 0)
+  if (rtn < 0) {
+    pthread_mutex_unlock (&cconn->rcv_mutex);
     return rtn;
+  }
   while (true) {
     rtn = receive_msg_data (&rconn, NULL, &cconn->terminated);
     if (rtn == 1) {
       cconn->rcv_msg = rconn.rcv_data.rcv_msg;
       cconn->rcv_msg_size = rconn.rcv_data.rcv_msg_size; 
       cconn->rcv_count++;
-      return (ssize_t) rconn.rcv_data.rcv_msg_size;
+      rtn = (ssize_t) rconn.rcv_data.rcv_msg_size;
+      pthread_mutex_unlock (&cconn->rcv_mutex);
+      return rtn;
     }
     if (rtn < 0)
       break;
   }
+  pthread_mutex_unlock (&cconn->rcv_mutex);
   return rtn;
 }
 
@@ -515,8 +519,10 @@ int server_receive_msgs (process_message_t handle_msg)
         rtn = receive_msg_data (conn, handle_msg, NULL);
       else
         continue;
-      if (rtn < 0)
+      if (rtn < 0) {
         conn->rcv_state = -2;
+        handle_msg (CMSG_ACTION_CONN_DROPPED, &conn->rcv_data);
+      }
     }
 
   pthread_mutex_lock (&SRV.list_mutex);
@@ -539,10 +545,24 @@ int server_receive_msgs (process_message_t handle_msg)
 }
 
 
-void cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated)
+int cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated)
 {
   int rtn;
   char inbuf[10];
+
+  pthread_mutex_lock (&SRV.connect_mutex);
+  if (SRV.listen_sock == -1) {
+    printf ("server not connected\n");
+    pthread_mutex_unlock (&SRV.connect_mutex);
+    return ENOTCONN;
+  }
+  if (SRV.is_listening) {
+    printf ("server already listening for messages\n");
+    pthread_mutex_unlock (&SRV.connect_mutex);
+    return EALREADY;
+  }
+  SRV.is_listening = true;
+  pthread_mutex_unlock (&SRV.connect_mutex);
 
   while (1)
   {
@@ -550,7 +570,7 @@ void cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated
 	  if (rtn < 0)
 	    break;
 	  if (rtn & 1)
-	    server_accept ();
+	    server_accept (handle_msg);
 	  if (rtn & 2)
 	    server_receive_msgs (handle_msg);
 	  if (SRV.terminate_on_keypress) {
@@ -563,11 +583,12 @@ void cmsg_server_listen_for_msgs (process_message_t handle_msg, bool *terminated
             if (*terminated)
 	      break;
   }
-  printf ("Exiting wait_for_msgs\n");
+  printf ("Exiting cmsg_server_listen_for_msgs\n");
   shutdown_server ();
+  return 0;
 }
 
-int cmsg_send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
+int __send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
 {
   int flags = 0;
   ssize_t bytes;
@@ -605,3 +626,35 @@ int cmsg_send_msg (int sock, const char *msg, size_t sz_msg, bool non_block)
   return 0;
 }
 
+int cmsg_client_send (struct client_conn *conn, const char *msg, size_t sz_msg, bool non_block)
+{
+  int rtn;
+
+  if (-1 == conn->sock) {
+    printf ("Invalid socket for cmsg_client_send\n");
+    return EBADF;
+  }
+  pthread_mutex_lock (&conn->send_mutex);
+  rtn = __send_msg (conn->sock, msg, sz_msg, non_block);
+  pthread_mutex_unlock (&conn->send_mutex);
+  return rtn;
+}
+
+int cmsg_server_send (int sock, const char *msg, size_t sz_msg, bool non_block)
+{
+  int rtn = EBADF;
+  struct connection *conn;
+
+  pthread_mutex_lock (&SRV.list_mutex);
+  LL_FOREACH (SRV.connection_list, conn)
+  {
+    if (conn->rcv_state >= 0) {
+      if (conn->rcv_data.sock == sock) {
+        rtn = __send_msg (sock, msg, sz_msg, non_block);
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock (&SRV.list_mutex);
+  return rtn;
+}

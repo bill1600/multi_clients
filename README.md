@@ -20,7 +20,8 @@ Messages vary from 100 to 8000 bytes in length.
 
 ## Building
 . make_cimpmsg.sh
-. make_cimomsg_test.sh
+
+. make_cimpmsg_test.sh
 
 ## Testing
 . cmsg_demo_server.sh

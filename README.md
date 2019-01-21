@@ -1,15 +1,33 @@
 # multi_clients
 Demo of socket server with multiple clients
 
-# Building
+# Original (Older)
+
+## Building
 . make_multi.sh
 
-# Testing
+## Testing
 . demo_server.sh
 
 In another terminal window:
 
 . demo_clients.sh
+
+Demo shows a server receiving messages from 24 clients, and sending a hello message to each client.
+Messages vary from 100 to 8000 bytes in length.
+
+# Package Version
+
+## Building
+. make_cimpmsg.sh
+. make_cimomsg_test.sh
+
+## Testing
+. cmsg_demo_server.sh
+
+In another terminal window:
+
+. cmsg_demo_clients.sh
 
 Demo shows a server receiving messages from 24 clients, and sending a hello message to each client.
 Messages vary from 100 to 8000 bytes in length.
